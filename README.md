@@ -59,15 +59,5 @@ RTE（辐射传输方程）
         → 沿太阳方向 1D 离散 → phi_fwd
 ```
 
-核心近似公式：
-
-```
-φ(x) ≈ Σ_j  T_src,j · σ_s,j Δs_j · C_boundary,j  ·  exp(−∫κ ds)  ·  1/r_j
-```
-
-其中 `∫κ ds ≈ √(3(1−ω₀)) · OD`，ω₀ = 0.999 时 ODScale ≈ 0.055，已烘焙进 shader。
-
-详细符号定义、σ_t / ω₀ 建模、与单次散射的对比见 **[PhiFwd_FromRTE.md](Docs/PhiFwd_FromRTE.md)**。
-
 ---
 
