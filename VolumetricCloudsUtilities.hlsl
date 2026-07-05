@@ -68,10 +68,6 @@ float _HP_DensityMultiplier;
 float _HP_DensityMultiplierCu;
 float _HP_DensityMultiplierTcu;
 float _HP_DensityMultiplierCb;
-// 云边缘柔化
-float _HP_CloudEdgeSoftnessTop;       // 顶/侧柔化倍率（直接缩放 1-heightGradient，1=原始密度反向）
-float _HP_CloudEdgeSoftnessBottom;    // 底部独立柔化宽度（height=0 处取到此值）
-float _HP_CloudEdgeSoftnessBottomPow; // 底部衰减指数：>1 快速收窄到底部（推荐 2~6）
 // 云底 3D 噪声淡出：局部高度 localHeight 接近 0 时 baseShape→1、detail→0，云底 XZ 密度均匀。
 // _HP_BottomSmoothHeight : 淡出区间（归一化局部高度 0~1），0=禁用
 // _HP_BottomSmoothPow    : 淡出曲线指数，>1=底部平坦区更长
@@ -227,15 +223,34 @@ float _HP_MS_Attenuation;
 float _HP_MS_Contribution;
 float _HP_MS_Eccentricity;
 
-// ── msWeight 对消光 & MS 强度的独立调制 ─────────────────────────────────────
-// _HP_MSW_ExtIntensity : msWeight 对视线消光的门控强度。1=完全门控（msWeight=0 则消光为 0），0=msWeight 不影响消光。
-// _HP_MSW_ExtContrast  : msWeight→消光的曲线指数。1=线性；>1=更陡（阈值化）；<1=更软。
+// ── Hi Weather A 通道 — 密度边缘软化 & 密度调制 ─────────────────────────────
+// 读取 _CloudMapHiTexture.a（散射 Cover 烘焙的 MS Weight）。
+// Soft：图越亮 softness→0，越暗→Soft Intensity。
+// Mod ：低 cover / 低 Hi A 处削减密度；高亮处保持。Contrast 越高暗区压得越狠。
+float _HP_HiA_DensitySoftIntensity;
+float _HP_HiA_DensitySoftContrast;
+float _HP_HiA_DensityModIntensity;
+float _HP_HiA_DensityModContrast;
 // _HP_MSW_MSContrast   : msWeight 作为 MS 直接比例因子的曲线指数。1=线性；>1=只有厚云柱才有明显 MS。
 // _HP_MSW_MSIntensity  : msWeight 路径 MS 贡献的整体强度倍率。0=禁用；1=不变；>1 增强 cover 驱动 MS。
-float _HP_MSW_ExtIntensity;
-float _HP_MSW_ExtContrast;
 float _HP_MSW_MSIntensity;
 float _HP_MSW_MSContrast;
+
+#define HP_HI_A_INV_WEIGHT(hiA, contrast) \
+    (1.0 - PositivePow(saturate(hiA), max(contrast, 0.01)))
+
+#define HP_HI_A_DENSITY_SOFTNESS(hiA) \
+    (_HP_HiA_DensitySoftIntensity \
+        * HP_HI_A_INV_WEIGHT(hiA, _HP_HiA_DensitySoftContrast))
+
+// brightVal：cover 或 Hi A，越高表示越亮/越密，越应保留密度。
+// Contrast>1 时 1-brightVal^c 比 (1-brightVal)^c 在暗区削减更狠。
+#define HP_DENSITY_MOD_DARK_WEIGHT(brightVal, contrast) \
+    (1.0 - PositivePow(saturate(brightVal), max(contrast, 0.01)))
+
+#define HP_HI_A_DENSITY_SCALE(brightVal) \
+    (1.0 - saturate(_HP_HiA_DensityModIntensity \
+        * HP_DENSITY_MOD_DARK_WEIGHT(brightVal, _HP_HiA_DensityModContrast)))
 
 // ── phi_fwd 物理漫射场（PhiFwd Diffuse Field） ─────────────────────────────────
 // τ≫1 扩散 regime：ω_0 写死；每步从局部 σ_t 拆 σ_s、σ_a。g_eff=0 → σ_tr=σ_t，故
@@ -248,11 +263,15 @@ float _HP_MSW_MSContrast;
 //                         saturate(localHeight + Bias)^DepthPow：DepthPow=1线性，0=禁用。建议 0.5~2.0。
 // _HP_PhiFwd_DepthBias  : 深度曲线垂直偏移。>0 底面保留更多漫射光（不降到0）；<0 过渡区上移，底面更暗。建议 -0.3~0.5。
 // _HP_PhiFwd_BoundaryConfidence : 2D 高度差分边界受光置信度强度。0=禁用，1=全量使用 wrap 边界受光。
+// _HP_PhiFwd_MSBuildScale : 各向同性 MS 建立速度。越大越快从边界方向性散射 lerp 到漫射源。
+// _HP_PhiFwd_Compress : phi_fwd 最终软饱和压缩。0=线性不压缩；越大越早饱和。
 float _HP_PhiFwd_Intensity;
 float _HP_PhiFwd_ODScale;
 float _HP_PhiFwd_DepthPow;
 float _HP_PhiFwd_DepthBias;
 float _HP_PhiFwd_BoundaryConfidence;
+float _HP_PhiFwd_MSBuildScale;
+float _HP_PhiFwd_Compress;
 
 // 用低云天气图重建一个便宜的云顶高度代理，供 phi_fwd 边界受光判断使用。
 // 这里只关心“最近相关边界是否面向太阳”，不参与密度本身的精确评估。
@@ -789,12 +808,8 @@ void EvaluateCloudProperties(float3 positionWS, float noiseMipOffset, float eros
     // Sc 廓形：scStr=1 时使用积云 R 通道（在压缩高度下采样，廓形即为压扁的积云形体）
     heightGradient = lerp(heightGradient, profiles.r, scStr);
     // （层云压平逻辑已删除，不再有 toStratus）
-    // 底部：物理高度驱动，BottomPow 控制衰减集中度，不影响云体中上部。
-    float bottomSoftness = PositivePow(1.0 - properties.height, max(_HP_CloudEdgeSoftnessBottomPow, 0.01))
-                         * _HP_CloudEdgeSoftnessBottom;
-    // 顶/侧：LUT 密度反向，乘以 Top 倍率可整体缩放软化宽度。
-    float topSoftness    = saturate(1.0 - heightGradient) * _HP_CloudEdgeSoftnessTop;
-    float edgeSoftness   = max(bottomSoftness, topSoftness);
+    // 密度边缘软化：Hi Weather A 越亮越硬（softness→0），越暗越软（softness→Intensity）
+    float edgeSoftness = HP_HI_A_DENSITY_SOFTNESS(hiWeatherLo.a);
 
     // ── Base shape 噪声（低云和高空云共用，R 通道 = PerlinWorley） ────────────
     // 风偏移由 HPWindField 累积 UV 偏移（世界空间 XZ）驱动。
@@ -892,6 +907,8 @@ void EvaluateCloudProperties(float3 positionWS, float noiseMipOffset, float eros
     // 此处保留字段初始值 1.0（由 ZERO_INITIALIZE 之后的显式赋值保证），不再用局部密度近似。
 
     properties.density = max(0.0, base_cloud * _HP_DensityMultiplier);
+    // 低云：用 Lo Cover（coverage）驱动密度削减——cover 越低密度压越多，高 cover 区保持
+    properties.density *= HP_HI_A_DENSITY_SCALE(coverage);
 
     // sigmaT：固定值（HanPi WeatherMap 无降水/云类型分层数据）。
     properties.sigmaT = 1;
@@ -971,15 +988,18 @@ float EvaluateHighCloudDensity(float3 positionWS, out float outNormalizedHeight)
     float  hiWisp     = SAMPLE_TEXTURE2D_LOD(_HP_HiWispTex, s_linear_repeat_sampler, hiWispUV, 0).r;
     hiWisp = saturate(pow(hiWisp,2));
 
-    // 密度：cover 经阈值化后驱动，低于阈值为 0，超出后在 softness 宽度内线性升至 1
+    // 密度：cover 经阈值化后驱动；Hi A 越亮 softness 越小，越暗越接近 hiDensitySoftness
+    float hiDensitySoft  = _HP_HiDensitySoftness
+                         * HP_HI_A_INV_WEIGHT(hiWeather.a, _HP_HiA_DensitySoftContrast);
     float hiBaseDensity = saturate(DensityRemap(hiEffCoverage,
                                                 _HP_HiDensityThreshold,
-                                                _HP_HiDensityThreshold + max(_HP_HiDensitySoftness, 0.001),
+                                                _HP_HiDensityThreshold + max(hiDensitySoft, 0.001),
                                                 0.0, 1.0));
 
     // cell 直接调制密度（主效果）：间隙处密度归零，格子中心保留满密度
     float hiCellFactor = lerp(1.0, hiCellShaped, hiCellThickStr);
     float hiDensity = (hiBaseDensity * hiCellFactor - hiWisp * _HP_HiWispStrength * hiType) * hiBandMask;
+    hiDensity      *= HP_HI_A_DENSITY_SCALE(hiWeather.a);
 
     return max(0.0, hiDensity * _HP_DensityMultiplierHi);
 }
@@ -1019,7 +1039,7 @@ bool GetCloudVolumeIntersection_Light(float3 originWS, float3 dir, out float tot
 #define CONE_MAX_DISTANCE 6000.0f
 
 // Function that evaluates the luminance at a given cloud position (only the contribution of the sun)
-float3 EvaluateSunLuminance(float3 positionWS, float3 sunDirection, float3 sunColor, PHASE_FUNCTION_STRUCTURE phaseFunction, out float lightExtinctionOD, out float phiFwd)
+float3 EvaluateSunLuminance(float3 positionWS, float currentLocalHeight, float3 sunDirection, float3 sunColor, PHASE_FUNCTION_STRUCTURE phaseFunction, out float lightExtinctionOD, out float phiFwd)
 {
     float totalLightDistance = 0.0;
     float3 luminance = float3(0.0, 0.0, 0.0);
@@ -1045,6 +1065,13 @@ float3 EvaluateSunLuminance(float3 positionWS, float3 sunDirection, float3 sunCo
         float T_cum         = 1.0f;
         float curWidth      = w0;
         float cumDist       = 0.0f;
+        float phiFwdBottomHeight = currentLocalHeight + _HP_PhiFwd_DepthBias;
+        float phiFwdColumnThickness = HP_EvaluatePhiFwdTopHeightProxy(positionWS.xz);
+        float phiFwdBottomSoftHeight = max(_HP_BottomSmoothHeight * lerp(1.0, 4.0, phiFwdColumnThickness), 0.001);
+        float srcBottomConfidence = (_HP_PhiFwd_DepthPow > 0.0)
+            ? 1.0 - exp(-max(phiFwdBottomHeight, 0.0) / phiFwdBottomSoftHeight * _HP_PhiFwd_DepthPow)
+            : 1.0;
+        float srcConfidence = HP_EvaluatePhiFwdBoundaryLight(positionWS, sunDirection) * srcBottomConfidence;
         [loop]
         for (int j = 0; j < numSteps; j++)
         {
@@ -1058,26 +1085,29 @@ float3 EvaluateSunLuminance(float3 positionWS, float3 sunDirection, float3 sunCo
             float mipOffset = (float)j / max((float)(numSteps - 1), 1.0f) * 3.0f;
             EvaluateCloudProperties(samplePosWS, mipOffset, 0.0, false, lightRayCloudProperties);
 
-            // 局部 σ：每步从 density·sigmaT 拆出；ω_0 写死，源强 Q ∝ σ_s·Δs
+            // 局部 σ：每步从 density·sigmaT 拆出；ω_0 写死。
             float sigma_t   = lightRayCloudProperties.density * lightRayCloudProperties.sigmaT;
             float sigma_s   = sigma_t * HP_PHIFWD_OMEGA0;
             float localOD   = sigma_t * stepWidth;   // ∫σ_t ds，本步光学厚度
-            float localOD_s = sigma_s * stepWidth;   // 散射源强度 ∝ σ_s·Δs
+            float qSrc      = sigma_s * stepWidth;   // Q：局部散射沉积 ∝ σ_s·Δs
+            float invD      = sigma_t;               // 1/D ∝ σ_tr；g_eff=0 时 σ_tr≈σ_t，常数 3 吸收到强度
 
-            // ── phi_fwd 1D 格林函数：φ += T_src·Q·exp(−∫κ ds)·(1/r) ──
-            // T_src 用扩散源的慢衰减近似，而不是单次散射的 exp(-τ) 快速衰减。
+            // ── phi_fwd 1D 格林函数：φ += T_src·(Q/D)·exp(−∫κ ds)·(1/r) ──
+            // T_src 表示无逃逸漫射源的吸收存活率，仅按 σ_a=(1-ω_0)σ_t 极慢衰减。
             // g=0 → κ = σ_t·sqrt(3(1−ω_0))，故 κ·Δs = localOD·KAPPA_OD_SCALE（sqrt 在宏里）
             float kappaStep     = localOD * HP_PHIFWD_KAPPA_OD_SCALE;
             // 体积衰减积到步中心（与 samplePosWS / dist 一致）：入口累积 + 本步半步（中点法则）
             float kappaToCenter = kappaODSum + kappaStep * 0.5f;
             float perSrcExp    = exp(-kappaToCenter);
+            // 各向同性 MS 需要经过一定光学深度才建立；边界第一步仍交给方向性散射。
+            float msBuild      = 1.0f - exp(-(extinctionSum + localOD * 0.5f) * max(_HP_PhiFwd_MSBuildScale, 0.0f));
             float invR         = 1.0f / max(dist, stepWidth * 0.5f); // 几何衰减 1/r_j，r_j = 到步中心距离
-            phiFwd            += (T_cum) * localOD_s * perSrcExp * invR;
+            phiFwd            += (T_cum) * qSrc * invD * srcConfidence * msBuild * perSrcExp * invR;
 
             extinctionSum += localOD;
             kappaODSum    += kappaStep; // 下一步入口的 ∫κ ds
 
-            float T_step = exp(-localOD * _HP_PhiFwd_ODScale);
+            float T_step = exp(-localOD * (1.0f - HP_PHIFWD_OMEGA0));
 
             T_cum            *= T_step;
 
@@ -1165,16 +1195,8 @@ void EvaluateCloud(CloudProperties cloudProperties, EnvironmentLighting envLight
                        : 0.0;
 
     // Apply the extinction
-    // 消光门控仍用高空云天气图 A 通道（原逻辑）；msWeight 仅驱动下方 MS Boost。
-    // ExtContrast 曲线调制后，在 [1-ExtIntensity, 1] 区间内缩放消光。
-    float msWeightForExt  = HP_IsInsideWeatherMapUV(msWeatherUV)
-                          ? SAMPLE_TEXTURE2D_LOD(_CloudMapHiTexture, s_linear_clamp_sampler, msWeatherUV, 0).a
-                          : 0.0;
-    float msWeightExt     = PositivePow(saturate(msWeightForExt), _HP_MSW_ExtContrast);
-    float extMSScale      = lerp(1.0 - _HP_MSW_ExtIntensity, 1.0, msWeightExt);
     const float extinction = cloudProperties.density * cloudProperties.sigmaT
-        * _HP_ViewAbsorption
-        * extMSScale;
+        * _HP_ViewAbsorption;
     const float transmittance = exp(-extinction * stepSize);
 
     // Evaluate the sun color at the position
@@ -1183,14 +1205,15 @@ void EvaluateCloud(CloudProperties cloudProperties, EnvironmentLighting envLight
     // Evaluate the sun's luminance
     float lightExtinctionOD;
     float phiFwd;
-    float3 totalLuminance = EvaluateSunLuminance(currentPositionWS, envLighting.sunDirection, sunColor, envLighting.phaseFunction, lightExtinctionOD, phiFwd);
+    float3 totalLuminance = EvaluateSunLuminance(currentPositionWS, cloudProperties.localHeight, envLighting.sunDirection, sunColor, envLighting.phaseFunction, lightExtinctionOD, phiFwd);
 
     // phi_fwd 仍由 msWeight 调制强度。
     float msWeightMS = PositivePow(saturate(msWeight), _HP_MSW_MSContrast);
 
     // ── 散射积分步长 ──────────────────────────────────────────────────────────
-    // 低密度边缘不具备足够光学厚度建立完整散射，因此方向性、phi_fwd 与环境散射
-    // 共用同一个密度门控后的有效散射步长；视线透射率仍用完整 extinction 保持云体不透明度。
+    // 低密度边缘不具备足够光学厚度建立完整方向性散射；方向性散射与环境散射
+    // 共用密度门控后的有效散射步长。视线透射率仍用完整 extinction 保持云体不透明度。
+    // phi_fwd 不受密度门控影响，始终用完整步长积分。
     float densityScatterGate   = HP_DENSITY_SCATTER_GATE(
         cloudProperties.density,
         _HP_DensityScatterGateThresh,
@@ -1203,22 +1226,17 @@ void EvaluateCloud(CloudProperties cloudProperties, EnvironmentLighting envLight
     // ── phi_fwd 物理漫射场加性散射（PhiFwd Diffuse Field） ───────────────────
     // phiFwd 是沿光线步进积累的各向同性漫射场能量密度（无量纲 OD 加权积分）。
     // 与 Hillaire 乘性 MS 正交：这是独立的加性散射项，代表真实扩散的漫射辐射场。
-    // 使用 scatterTransmittance（density-gated）做步长积分：
-    //   densityScatterGate≈0（稀薄边缘）→ 积分量趋近 0
-    //   densityScatterGate≈1（稠密核心）→ 完整散射积分
+    // 使用完整 transmittance 做步长积分（不受 densityScatterGate 影响）。
     //
-    // DepthPow 修正：phi_fwd 从视线采样点出发向太阳积分，云底采样点会积累到整个云柱的散射源，
-    // 导致底部 phiFwd 反而最大——与真实扩散场（从顶向下衰减）相反。
-    // 用 localHeight^DepthPow 修正：localHeight=1（云顶）→ 权重满；localHeight=0（云底）→ 权重最小。
+    // 底部/边界置信度已在 EvaluateSunLuminance 的源项中应用；这里仅将积分结果注入视线散射。
     if (_HP_PhiFwd_Intensity > 0.0)
     {
-        float phiFwdDepthCorrect = (_HP_PhiFwd_DepthPow > 0.0)
-            ? PositivePow(saturate(cloudProperties.localHeight + _HP_PhiFwd_DepthBias), _HP_PhiFwd_DepthPow)
-            : 1.0;
-        float phiFwdBoundaryLight = HP_EvaluatePhiFwdBoundaryLight(currentPositionWS, envLighting.sunDirection);
-        phiFwdDepthCorrect *= phiFwdBoundaryLight;
-        float3 phiFwdLuminance = phiFwd * sunColor * (_HP_PhiFwd_Intensity * msWeightMS * _HP_MSW_MSIntensity * phiFwdDepthCorrect);
-        integScatt += phiFwdLuminance - phiFwdLuminance * scatterTransmittance;
+        float phiFwdScalar = phiFwd * (_HP_PhiFwd_Intensity * msWeightMS * _HP_MSW_MSIntensity);
+        float phiFwdMapped = (_HP_PhiFwd_Compress > 0.0)
+            ? (1.0 - exp(-phiFwdScalar * _HP_PhiFwd_Compress)) / _HP_PhiFwd_Compress
+            : phiFwdScalar;
+        float3 phiFwdLuminance = phiFwdMapped * sunColor;
+        integScatt += phiFwdLuminance - phiFwdLuminance * transmittance;
     }
 
     // ── 环境光散射（独立积分，使用完整 stepSize）────────────────────────────
