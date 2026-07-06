@@ -114,3 +114,17 @@ RTE（辐射传输方程）
 
 ---
 
+---
+
+## 许可与署名
+
+本项目采用 [MIT License](LICENSE)，并附加 **署名要求（Additional Attribution Requirement）**。
+
+
+**推荐署名格式：**
+
+> HanPi Volume Cloud © [AshenOneArt](https://github.com/AshenOneArt)  
+> https://github.com/AshenOneArt/HPVolumeCloud
+
+分发时须同时保留 `LICENSE` 中的版权声明与许可全文。
+
