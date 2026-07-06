@@ -3,7 +3,7 @@
 HDRP 体积云渲染系统。本文档重点介绍 **phi_fwd 物理漫射场**——用于模拟厚云中**各向同性多重散射**的加性光照项。
 
 > 完整物理推导见：[Docs/PhiFwd_FromRTE.md](Docs/PhiFwd_FromRTE.md)
->
+
 > ## Third-Party Notice
 
 Portions of this work are derived from Unity High Definition Render Pipeline (HDRP),
